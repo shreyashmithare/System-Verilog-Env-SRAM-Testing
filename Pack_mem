@@ -1,0 +1,496 @@
+// Enhanced SystemVerilog Environment for SRAM Testing
+// Features: SVA, LFSR, Comprehensive Reporting
+
+// Package Definition
+package pack_mem;
+
+  // LFSR Class for Pseudo-Random Generation
+  class LFSR #(parameter WIDTH = 4);
+    logic [WIDTH-1:0] state;
+    logic [WIDTH-1:0] tap_mask;
+    
+    function new(logic [WIDTH-1:0] seed = 4'b0001);
+      this.state = seed;
+      // Standard 4-bit LFSR taps (polynomial: x^4 + x^3 + 1)
+      if (WIDTH == 4)
+        this.tap_mask = 4'b1001;
+      else
+        this.tap_mask = {1'b1, {WIDTH-2{1'b0}}, 1'b1}; // Generic fallback
+    endfunction
+    
+    function logic [WIDTH-1:0] next();
+      logic feedback;
+      feedback = ^(state & tap_mask); // XOR of tapped bits
+      state = {state[WIDTH-2:0], feedback};
+      return state;
+    endfunction
+    
+    function logic [WIDTH-1:0] get_current();
+      return state;
+    endfunction
+    
+    function void reset(logic [WIDTH-1:0] seed = 4'b0001);
+      this.state = seed;
+    endfunction
+  endclass
+
+  // Enhanced Transaction Class
+  class Transaction #(parameter DATA_WIDTH = 32, ADDR_WIDTH = 4);
+    rand bit write_en;
+    rand bit read_en;
+    rand bit reset_n;
+    rand bit [ADDR_WIDTH - 1 : 0] address;
+    rand bit [DATA_WIDTH - 1 : 0] data_in;
+    
+    logic [DATA_WIDTH - 1 : 0] data_out;
+    logic valid_out;
+    
+    // Enhanced constraints
+    constraint const_reset_n    {reset_n  dist {0:=5, 1:=95};}
+    constraint reset_behavior 
+    {
+      if (reset_n == 0) 
+      {
+        write_en == 0;
+        read_en == 0;
+        address == 0;
+        data_in == 0;
+      }
+    }
+    constraint const_address    {address  dist {[0 : 4]:=40, [5 : 10]:=30, [11 : $]:=30};}
+    constraint const_data_in    {data_in  dist {[0 : 400]:/30, [401 : 800]:/25, [801 : 1000]:/25,[1001 : $]:/20};}
+    constraint const_read_write {read_en != write_en;}
+
+    function void display(string class_name);
+      $display("[%0s] @%0t: reset_n=%0b read_en=%0b write_en=%0b address=%0d data_in=%0d data_out=%0d valid_out=%0b", 
+               class_name, $time, reset_n, read_en, write_en, address, data_in, data_out, valid_out);
+    endfunction
+  endclass
+
+  // Enhanced Sequencer Class with LFSR
+  class Sequencer #(parameter DATA_WIDTH = 32, ADDR_WIDTH = 4);
+    mailbox #(Transaction) trans_mbox;
+    Transaction trans;
+    LFSR #(ADDR_WIDTH) addr_lfsr;
+    LFSR #(16) data_lfsr;  // 16-bit LFSR for data generation
+    
+    int sequence_count;
+
+    function new(mailbox #(Transaction) trans_mbox);
+      this.trans_mbox = trans_mbox;
+      this.addr_lfsr = new(4'b0001);
+      this.data_lfsr = new(16'h0001);
+      this.sequence_count = 0;
+    endfunction
+
+    task run();
+      sequence_count++;
+      $display("[SEQUENCER] Starting sequence %0d", sequence_count);
+      
+      // Reset sequence - hold for multiple cycles
+      $display("[SEQUENCER] Applying reset");
+      repeat(3) begin
+        trans = new();
+        trans.reset_n = 0;
+        trans.write_en = 0;
+        trans.read_en = 0;
+        trans.address = 0;
+        trans.data_in = 0;
+        trans_mbox.put(trans);
+      end
+      
+      // Release reset
+      trans = new();
+      trans.reset_n = 1;
+      trans.write_en = 0;
+      trans.read_en = 0;
+      trans.address = 0;
+      trans.data_in = 0;
+      trans_mbox.put(trans);
+      
+      // Wait a few cycles after reset
+      repeat(2) begin
+        trans = new();
+        trans.reset_n = 1;
+        trans.write_en = 0;
+        trans.read_en = 0;
+        trans.address = 0;
+        trans.data_in = 0;
+        trans_mbox.put(trans);
+      end
+      
+      // Write all memory locations with known pattern
+      $display("[SEQUENCER] Writing test pattern to all locations");
+      for (int i = 0; i < 16; i++) begin
+        trans = new();
+        trans.reset_n = 1;
+        trans.write_en = 1;
+        trans.read_en = 0;
+        trans.address = i;
+        trans.data_in = 32'hDEAD0000 + i; // Known pattern
+        trans_mbox.put(trans);
+      end
+      
+      // Add some idle cycles
+      repeat(2) begin
+        trans = new();
+        trans.reset_n = 1;
+        trans.write_en = 0;
+        trans.read_en = 0;
+        trans.address = 0;
+        trans.data_in = 0;
+        trans_mbox.put(trans);
+      end
+      
+      // Read back all locations
+      $display("[SEQUENCER] Reading back all locations");
+      for (int i = 0; i < 16; i++) begin
+        trans = new();
+        trans.reset_n = 1;
+        trans.write_en = 0;
+        trans.read_en = 1;
+        trans.address = i;
+        trans.data_in = 0;
+        trans_mbox.put(trans);
+      end
+      
+      // Write using LFSR-generated addresses and data
+      $display("[SEQUENCER] Writing LFSR-generated data");
+      for (int i = 0; i < 10; i++) begin
+        trans = new();
+        trans.reset_n = 1;
+        trans.write_en = 1;
+        trans.read_en = 0;
+        trans.address = addr_lfsr.next();
+        trans.data_in = {data_lfsr.next(), data_lfsr.next()}; // Combine two 16-bit values
+        trans_mbox.put(trans);
+      end
+      
+      // Add idle cycles
+      repeat(2) begin
+        trans = new();
+        trans.reset_n = 1;
+        trans.write_en = 0;
+        trans.read_en = 0;
+        trans.address = 0;
+        trans.data_in = 0;
+        trans_mbox.put(trans);
+      end
+      
+      // Read back using LFSR addresses
+      $display("[SEQUENCER] Reading back with LFSR addresses");
+      addr_lfsr.reset(4'b0001); // Reset to same initial state
+      for (int i = 0; i < 10; i++) begin
+        trans = new();
+        trans.reset_n = 1;
+        trans.write_en = 0;
+        trans.read_en = 1;
+        trans.address = addr_lfsr.next();
+        trans.data_in = 0;
+        trans_mbox.put(trans);
+      end
+      
+      // Random transactions with proper constraints
+      $display("[SEQUENCER] Generating constrained random transactions");
+      for (int i = 0; i < 20; i++) begin
+        trans = new();
+        void'(trans.randomize());
+        trans_mbox.put(trans);
+      end
+      
+      $display("[SEQUENCER] Sequence %0d completed", sequence_count);
+    endtask
+  endclass
+
+  // Enhanced Driver Class
+  class Driver;
+    virtual Intf vif;
+    Transaction trans;
+    mailbox #(Transaction) trans_mbox;
+    int drive_count;
+
+    function new(virtual Intf vif, mailbox #(Transaction) trans_mbox);
+      this.vif = vif;
+      this.trans_mbox = trans_mbox;
+      this.drive_count = 0;
+    endfunction
+
+    task run();
+      forever begin
+        trans_mbox.get(trans);
+        drive_count++;
+        trans.display("DRIVER");
+        
+        // Drive on negedge for setup time
+        @(negedge vif.clk);
+        vif.reset_n  <= trans.reset_n;
+        vif.read_en  <= trans.read_en;
+        vif.write_en <= trans.write_en;
+        vif.address  <= trans.address;
+        vif.data_in  <= trans.data_in;
+        
+        // Hold for one clock cycle to ensure proper timing
+        @(posedge vif.clk);
+      end
+    endtask
+    
+    function void report();
+      $display("[DRIVER REPORT] Total transactions driven: %0d", drive_count);
+    endfunction
+  endclass
+
+  // Enhanced Monitor Class
+  class Monitor;
+    virtual Intf vif;
+    mailbox #(Transaction) mon_sub_mbox;
+    mailbox #(Transaction) mon_scb_mbox;
+    Transaction trans;
+    int monitor_count;
+
+    function new(virtual Intf vif, mailbox #(Transaction) mon_sub_mbox, mailbox #(Transaction) mon_scb_mbox);
+      this.vif = vif;
+      this.mon_sub_mbox = mon_sub_mbox;
+      this.mon_scb_mbox = mon_scb_mbox;
+      this.monitor_count = 0;
+    endfunction
+
+    task run();
+      forever begin
+        @(posedge vif.clk);
+        // Only monitor meaningful transactions
+        if (vif.reset_n && (vif.read_en || vif.write_en)) begin
+          trans = new();
+          trans.address   = vif.address;
+          trans.write_en  = vif.write_en;
+          trans.read_en   = vif.read_en;
+          trans.data_in   = vif.data_in;
+          trans.reset_n   = vif.reset_n;
+          trans.data_out  = vif.data_out;
+          trans.valid_out = vif.valid_out;
+          
+          monitor_count++;
+          trans.display("MONITOR");
+          mon_sub_mbox.put(trans);
+          mon_scb_mbox.put(trans);
+        end
+        // Monitor reset cycles separately
+        else if (!vif.reset_n) begin
+          trans = new();
+          trans.address   = vif.address;
+          trans.write_en  = vif.write_en;
+          trans.read_en   = vif.read_en;
+          trans.data_in   = vif.data_in;
+          trans.reset_n   = vif.reset_n;
+          trans.data_out  = vif.data_out;
+          trans.valid_out = vif.valid_out;
+          
+          monitor_count++;
+          trans.display("MONITOR-RESET");
+          mon_sub_mbox.put(trans);
+          mon_scb_mbox.put(trans);
+        end
+      end
+    endtask
+    
+    function void report();
+      $display("[MONITOR REPORT] Total transactions monitored: %0d", monitor_count);
+    endfunction
+  endclass
+
+  // Enhanced Scoreboard Class with LFSR validation
+  class Scoreboard #(int DATA_WIDTH = 32, ADDR_WIDTH = 4);
+    mailbox #(Transaction) mon_scb_mbox;
+    Transaction trans;
+    int no_trans, pass_count, fail_count;
+    
+    localparam mem_depth = 1 << ADDR_WIDTH;
+    logic [DATA_WIDTH - 1 : 0] mem_array [mem_depth];
+    LFSR #(16) expected_data_lfsr;
+    
+    function new(mailbox #(Transaction) mon_scb_mbox);
+      this.mon_scb_mbox = mon_scb_mbox;
+      this.expected_data_lfsr = new(16'h0001);
+      this.pass_count = 0;
+      this.fail_count = 0;
+      // Initialize memory model
+      foreach(mem_array[i])
+        mem_array[i] = 'b0;
+    endfunction
+
+    task run();
+      forever begin
+        mon_scb_mbox.get(trans);
+        no_trans++;
+        
+        if (!trans.reset_n) begin
+          $display("[SCB-RESET] @%0t: Memory cleared", $time);
+          foreach(mem_array[i])
+            mem_array[i] = 'b0;
+          expected_data_lfsr.reset(16'h0001);
+        end
+        else if (trans.write_en && !trans.read_en) begin
+          mem_array[trans.address] = trans.data_in;
+          $display("[SCB-WRITE] @%0t: Addr=%0d, Data=%0h", $time, trans.address, trans.data_in);
+        end
+        else if (trans.read_en && !trans.write_en) begin
+          // Check data match
+          if (mem_array[trans.address] !== trans.data_out) begin
+            $error("[SCB-READ-FAIL] @%0t: Addr=%0d, Expected=%0h, Actual=%0h", 
+                   $time, trans.address, mem_array[trans.address], trans.data_out);
+            fail_count++;
+          end
+          // Check valid signal
+          else if (trans.valid_out !== 1) begin
+            $error("[SCB-VALID-FAIL] @%0t: Addr=%0d, valid_out=%0b (expected 1)", 
+                   $time, trans.address, trans.valid_out);
+            fail_count++;
+          end
+          else begin
+            $display("[SCB-READ-PASS] @%0t: Addr=%0d, Data=%0h, Valid=%0b", 
+                     $time, trans.address, trans.data_out, trans.valid_out);
+            pass_count++;
+          end
+        end
+        else begin
+          // Idle state - no operation
+          $display("[SCB-IDLE] @%0t: No operation", $time);
+        end
+      end
+    endtask
+    
+    function void report();
+      $display("========== SCOREBOARD REPORT ==========");
+      $display("Total Transactions: %0d", no_trans);
+      $display("Read Operations: %0d", pass_count + fail_count);
+      $display("Passed: %0d", pass_count);
+      $display("Failed: %0d", fail_count);
+      if (pass_count + fail_count > 0)
+        $display("Success Rate: %0.2f%%", (pass_count * 100.0) / (pass_count + fail_count));
+      else
+        $display("Success Rate: N/A (No read operations)");
+      $display("======================================");
+    endfunction
+  endclass
+
+  // Enhanced Subscriber Class
+  class Subscriber #(int DATA_WIDTH = 32, ADDR_WIDTH = 4);
+    mailbox #(Transaction) mon_sub_mbox;
+    Transaction trans;
+    int coverage_count;
+
+    covergroup mem_cov;
+      reset: coverpoint trans.reset_n {
+        bins low   = {0};
+        bins high  = {1};
+        bins trans_low_high = (0=>1);
+        bins trans_high_low = (1=>0);
+      }
+      read: coverpoint trans.read_en {
+        bins high  = {1};
+        bins low   = {0};
+      }
+      write: coverpoint trans.write_en {
+        bins write = {1};
+        bins read  = {0};
+      }
+      address: coverpoint trans.address {
+        bins low_addr[] = {[0:7]};
+        bins high_addr[] = {[8:15]};
+        bins all_addr[] = {[0:2**ADDR_WIDTH - 1]};
+      }
+      data_in: coverpoint trans.data_in {
+        bins data_low = {[0:1000]};
+        bins data_mid = {[1001:10000]};
+        bins data_high = {[10001:$]};
+      }
+      valid_out: coverpoint trans.valid_out {
+        bins valid = {1};
+        bins invalid = {0};
+      }
+      
+      // Cross coverage
+      cross_addr_read: cross address, read;
+      cross_addr_write: cross address, write;
+      cross_valid_read: cross valid_out, read;
+    endgroup
+
+    function new(mailbox #(Transaction) mon_sub_mbox);
+      this.mon_sub_mbox = mon_sub_mbox;
+      mem_cov = new();
+      this.coverage_count = 0;
+    endfunction
+
+    task run();
+      forever begin
+        mon_sub_mbox.get(trans);
+        coverage_count++;
+        $display("[SUBSCRIBER] Sample %0d: addr=%0d data_in=%0d read=%b write=%b valid=%b",
+                 coverage_count, trans.address, trans.data_in, trans.read_en, trans.write_en, trans.valid_out);
+        mem_cov.sample();
+      end
+    endtask
+    
+    function void report();
+      $display("========== COVERAGE REPORT ==========");
+      $display("Total Coverage Samples: %0d", coverage_count);
+      $display("Overall Coverage: %0.2f%%", mem_cov.get_coverage());
+      $display("=====================================");
+    endfunction
+  endclass
+
+  // Enhanced Environment Class
+  class Env;
+    Driver driver_inst;
+    Sequencer #(32, 4) seqncr_inst;
+    Monitor monitr_inst;
+    Scoreboard #(32, 4) scbrd_inst;
+    Subscriber #(32, 4) subs_inst;
+    
+    mailbox #(Transaction) tr_mbox;
+    mailbox #(Transaction) mon_sub_mbox;
+    mailbox #(Transaction) mon_scb_mbox;
+    
+    int test_start_time;
+
+    function new(virtual Intf vif);
+      tr_mbox = new();
+      mon_sub_mbox = new();
+      mon_scb_mbox = new();
+      
+      seqncr_inst = new(tr_mbox);
+      driver_inst = new(vif, tr_mbox);
+      scbrd_inst = new(mon_scb_mbox);
+      subs_inst = new(mon_sub_mbox);
+      monitr_inst = new(vif, mon_sub_mbox, mon_scb_mbox);
+      
+      test_start_time = $time;
+    endfunction
+
+    task run(int num);
+      $display("========== TEST STARTED ==========");
+      $display("Running %0d sequences", num);
+      
+      fork
+        repeat(num) begin
+          seqncr_inst.run();
+          #100; // Gap between sequences
+        end
+        driver_inst.run();
+        monitr_inst.run();
+        scbrd_inst.run();
+        subs_inst.run();
+      join_none
+    endtask
+    
+    task final_report();
+      $display("\n========== FINAL TEST REPORT ==========");
+      $display("Test Duration: %0t", $time - test_start_time);
+      driver_inst.report();
+      monitr_inst.report();
+      scbrd_inst.report();
+      subs_inst.report();
+      $display("======================================\n");
+    endtask
+  endclass
+
+endpackage
